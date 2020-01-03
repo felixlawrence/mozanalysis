@@ -37,6 +37,9 @@ class DataSource(object):
         This query does not define ``enrollments`` but otherwise could
         be executed to query all metrics from this data source.
         """
+        for m in metric_list:
+            assert m.data_source == self
+
         return """SELECT
             e.client_id,
             e.analysis_window_start,
@@ -103,9 +106,9 @@ class Metric(object):
 
     Needs to be combined with an analysis window to be measurable!
     """
-    name = attr.ib(type=str)
-    data_source = attr.ib(type=DataSource)
-    select_expr = attr.ib(type=str)
+    name = attr.ib(validator=attr.validators.instance_of(str))
+    data_source = attr.ib(validator=attr.validators.instance_of(DataSource))
+    select_expr = attr.ib(validator=attr.validators.instance_of(str))
 
 
 def agg_sum(select_expr):

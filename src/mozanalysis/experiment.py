@@ -2,61 +2,9 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 import attr
-import re
 
-from google.cloud import bigquery
-from google.api_core.exceptions import Conflict
-
+from mozanalysis.bq_util import sanitize_table_name_for_bq
 from mozanalysis.utils import add_days, date_sub
-
-
-def sanitize_table_name_for_bq(table_name):
-    of_good_character_but_possibly_verbose = re.sub(r'[^a-zA-Z_0-9]', '_', table_name)
-
-    if len(of_good_character_but_possibly_verbose) <= 1024:
-        return of_good_character_but_possibly_verbose
-
-    return of_good_character_but_possibly_verbose[:500] + '___' \
-        + of_good_character_but_possibly_verbose[-500:]
-
-
-class BigqueryStuff(object):
-    def __init__(self, dataset_id, project_id='moz-fx-data-bq-data-science'):
-        self.dataset_id = dataset_id
-        self.project_id = project_id
-        self.client = bigquery.Client(project=project_id)
-
-
-def run_query(bq_stuff, sql, results_table=None):
-    """Run a query and return the result.
-
-    If ``results_table`` is provided, then save the results
-    into there (or just query from there if it already exists).
-    """
-    if not results_table:
-        return bq_stuff.client.query(sql).result()
-
-    try:
-        full_res = bq_stuff.client.query(
-            sql,
-            job_config=bigquery.QueryJobConfig(
-                destination=bq_stuff.client.dataset(
-                    bq_stuff.dataset_id
-                ).table(results_table)
-            )
-        ).result()
-        print('Saved into', results_table)
-        return full_res
-
-    except Conflict:
-        print("Full results table already exists. Reusing", results_table)
-        return bq_stuff.client.query(
-            "SELECT * FROM `{project_id}.{dataset_id}.{full_table_name}`".format(
-                project_id=bq_stuff.project_id,
-                dataset_id=bq_stuff.dataset_id,
-                full_table_name=results_table,
-            )
-        ).result()
 
 
 @attr.s(frozen=True, slots=True)
@@ -161,7 +109,7 @@ class Experiment(object):
     def get_single_window_data(
         self, bq_stuff, metric_list, last_date_full_data,
         analysis_start_days, analysis_length_days, enrollments_query_type='normandy',
-        custom_enrollments_query=None
+        custom_enrollments_query=None, segment_list=None
     ):
         """Query per-client metric values.
 
@@ -231,19 +179,20 @@ class Experiment(object):
         )
 
         full_sql = self._build_query(
-            metric_list, time_limits, enrollments_query_type, custom_enrollments_query
+            metric_list, segment_list or [], time_limits, enrollments_query_type,
+            custom_enrollments_query
         )
 
         full_res_table_name = sanitize_table_name_for_bq('_'.join(
             [last_date_full_data, self.experiment_slug, str(hash(full_sql))]
         ))
 
-        return run_query(bq_stuff, full_sql, full_res_table_name)
+        return bq_stuff.run_query(full_sql, full_res_table_name)
 
     def get_time_series_data(
         self, bq_stuff, metric_list, last_date_full_data,
         time_series_period='weekly', enrollments_query_type='normandy',
-        custom_enrollments_query=None
+        custom_enrollments_query=None, segment_list=None
     ):
         """Query per-client metric values over a time series.
 
@@ -305,19 +254,19 @@ class Experiment(object):
         )
 
         full_sql = self._build_query(
-            metric_list, time_limits, enrollments_query_type, custom_enrollments_query
+            metric_list, segment_list or [], time_limits, enrollments_query_type,
+            custom_enrollments_query
         )
 
         full_res_table_name = sanitize_table_name_for_bq('_'.join(
             [last_date_full_data, self.experiment_slug, str(hash(full_sql))]
         ))
 
-        full_res = run_query(bq_stuff, full_sql, full_res_table_name)
+        full_res = bq_stuff.run_query(full_sql, full_res_table_name)
 
         ts_res = {
 
-            aw.start: run_query(
-                bq_stuff,
+            aw.start: bq_stuff.run_query(
                 self._build_analysis_window_subset_query(
                     bq_stuff, aw, full_res_table_name
                 ),
@@ -329,7 +278,7 @@ class Experiment(object):
         return ts_res, full_res
 
     def _build_query(
-        self, metric_list, time_limits, enrollments_query_type,
+        self, metric_list, segment_list, time_limits, enrollments_query_type,
         custom_enrollments_query=None,
     ):
         """Return SQL to query metric data for users.
@@ -352,11 +301,12 @@ class Experiment(object):
         {analysis_windows_query}
     ),
     raw_enrollments AS ({enrollments_query}),
+    segmented_enrollments AS ({segments_query}),
     enrollments AS (
         SELECT
             e.*,
             aw.*
-        FROM raw_enrollments e
+        FROM segmented_enrollments e
         CROSS JOIN analysis_windows aw
     )
     SELECT
@@ -367,6 +317,7 @@ class Experiment(object):
         """.format(
             analysis_windows_query=analysis_windows_query,
             enrollments_query=enrollments_query,
+            segments_query=self._build_segments_query(segment_list),
             metrics_columns=',\n        '.join(metrics_columns),
             metrics_joins='\n'.join(metrics_joins)
         )
@@ -446,6 +397,28 @@ class Experiment(object):
             experiment_slug=self.experiment_slug,
             first_enrollment_date=time_limits.first_enrollment_date,
             last_enrollment_date=time_limits.last_enrollment_date,
+        )
+
+    def _build_segments_query(self, segment_list):
+        # For now only support `clients_last_seen` and ignore bias due to
+        # potential use of post-enrollment data
+        return """
+        SELECT
+            e.*,
+            {segments}
+        FROM enrollments e
+            LEFT JOIN `moz-fx-data-shared-prod.telemetry.clients_last_seen` cls
+                ON cls.client_id = e.client_id
+                AND cls.submission_date = e.enrollment_date
+        GROUP BY e.*
+        """.format(
+            segments=',\n            '.join(
+                "{expr} AS {col_name}".format(
+                    expr=s.select_expr,
+                    col_name=s.name
+                )
+                for s in segment_list
+            ),
         )
 
     def _build_metrics_query_bits(self, metric_list, time_limits):
